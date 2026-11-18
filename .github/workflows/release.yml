@@ -561,7 +561,8 @@ jobs:
           # And nothing else: a file the list above does not name would go up unannounced.
           for path in dist/*; do
             case "${path#dist/}" in
-              "TMPlayer-$VERSION-universal.apk" | "TMPlayer-$VERSION-android-tv.apk") ;;
+              "TMPlayer-$VERSION-universal.apk" | "TMPlayer-$VERSION-android-tv.apk" | \
+                "TMPlayer-$VERSION-lg-webos.ipk" | "TMPlayer-$VERSION-samsung-tizen.wgt") ;;
               *) echo "::error::$path is not one of the release's files"; exit 1 ;;
             esac
           done
