@@ -280,6 +280,9 @@ jobs:
   # self-test, and the image should not move under a release.
   desktop-linux:
     name: Desktop (Linux)
+    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
+    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
+    if: false
     needs: version
     runs-on: ubuntu-24.04
     # The Telegram credentials are secrets of this environment.
@@ -289,9 +292,6 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up JDK 21
-    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
-    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
-    if: false
         uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -353,6 +353,9 @@ jobs:
 
   desktop-windows:
     name: Desktop (Windows)
+    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
+    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
+    if: false
     needs: version
     runs-on: windows-latest
     environment: release
@@ -361,9 +364,6 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up JDK 21
-    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
-    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
-    if: false
         uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -421,6 +421,9 @@ jobs:
 
   desktop-macos:
     name: Desktop (macOS)
+    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
+    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
+    if: false
     needs: version
     runs-on: macos-26
     environment: release
@@ -429,9 +432,6 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up JDK 21
-    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
-    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
-    if: false
         uses: actions/setup-java@v5
         with:
           distribution: temurin
