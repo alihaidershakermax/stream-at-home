@@ -1,0 +1,354 @@
+// A stand-in for @mtcute/web in the end to end tests (e2e/vite.e2e.ts swaps it in), loaded by the
+// real Telegram worker so its paging, the app's rules and the player run unchanged: one signed in
+// account, a few chats, and the small files in e2e/media served as Telegram's file chunks.
+// A test picks a case with the `e2e` cookie, which /__e2e/flags hands back to the worker:
+// `signedout`, `revoked` (Telegram says the session ended), `slow` (lists answer after 3 s),
+// `password` (signed out, the QR code is taken at once and the account asks its two-step password).
+
+// Read synchronously (a worker may): a top-level await would hold back the worker's message
+// handler, and the page's first call would be lost.
+import { cloudFor } from './cloud'
+
+function get(url: string): string {
+    const xhr = new XMLHttpRequest()
+    xhr.open('GET', url, false)
+    xhr.send()
+    return xhr.responseText
+}
+const flags = new Set(get('/__e2e/flags').split(',').filter(Boolean))
+/** Saved Messages for the sync file: one per test (`cloud:<key>`), kept by the test server. */
+const cloud = cloudFor([...flags].find((f) => f.startsWith('cloud:'))?.slice('cloud:'.length) ?? 'default')
+const sizes: Record<string, number> = JSON.parse(get('/__e2e/sizes'))
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const rpcError = (text: string, code = 400) => Object.assign(new Error(text), { text, code })
+const THUMB = '/__e2e/media/thumb.jpg'
+
+export class User {
+    constructor(public raw: unknown) {}
+    get id() {
+        return 1
+    }
+    get displayName() {
+        return 'Dana Test'
+    }
+    get username() {
+        return 'danatest'
+    }
+}
+export class SentCode {}
+export class WebCryptoProvider {
+    constructor(_?: unknown) {}
+}
+export class BaseTelegramClient {
+    constructor(_: unknown) {}
+}
+export class Photo {
+    constructor(public raw: unknown) {}
+    get thumbnails() {
+        return [this.getThumbnail()]
+    }
+    getThumbnail() {
+        return { uniqueFileId: 'sponsor-photo', url: THUMB }
+    }
+}
+export function _messageMediaFromTl(_: unknown, m: unknown) {
+    return m ? new Photo(m) : null
+}
+
+interface Peer {
+    id: number
+    displayName: string
+    type: 'user' | 'chat'
+    chatType: string
+    username?: string | null
+    about?: string
+    members?: number
+    isSelf: boolean
+    isBot: boolean
+    isForum: boolean
+    photo: unknown
+    raw: Record<string, unknown>
+}
+
+const peers = new Map<number, Peer>()
+function peer(id: number, title: string, type: 'user' | 'chat', extra: Partial<Peer> = {}): Peer {
+    const p: Peer = { id, displayName: title, type, chatType: 'supergroup', isSelf: false, isBot: false, isForum: false, photo: null, raw: {}, ...extra }
+    peers.set(id, p)
+    return p
+}
+
+interface Opts {
+    /** The real file in e2e/media whose bytes it has; else a name only, and a size. */
+    file?: string
+    size?: number
+    video?: boolean
+    duration?: number
+    ttl?: number
+    withheld?: boolean
+    /** What Telegram says the file is (a document's mime type), else it is told from the name. */
+    mime?: string
+}
+
+let n = 0
+function msg(chat: Peer, name: string, o: Opts = {}) {
+    const id = ++n
+    const size = o.file ? sizes[o.file] : (o.size ?? 0)
+    const thumb = { uniqueFileId: `thumb${id}`, url: THUMB }
+    return {
+        id,
+        chat,
+        date: new Date(Date.UTC(2026, 9, 1) + id * 3600_000),
+        text: '',
+        groupedId: null,
+        media: {
+            type: o.video ? 'video' : 'document',
+            fileName: name,
+            mimeType: o.mime ?? (name.endsWith('.pdf') ? 'application/pdf' : 'video/mp4'),
+            // `big`: every video says 1.5 GB, past the carousel's 400 MB floor (its bytes stay the real file's).
+            // `mid`: every video says 100 MB, over Home's 50 MB floor and under the carousel's 400 MB.
+            fileSize: flags.has('big') && o.file ? 1_500_000_000 : flags.has('mid') && o.file ? 100_000_000 : size,
+            uniqueFileId: `file${id}`,
+            location: { _: 'fake', file: o.file ?? null },
+            dcId: 2,
+            duration: o.video ? (o.duration ?? 4) : 0,
+            width: 320,
+            height: 180,
+            isRound: false,
+            isAnimation: false,
+            thumbnails: [thumb],
+            getThumbnail: () => thumb,
+        },
+        raw: {
+            _: 'message',
+            noforwards: false,
+            media: { _: 'messageMediaDocument', ttlSeconds: o.ttl, altDocuments: [] },
+            restrictionReason: o.withheld ? [{ platform: 'all', reason: 'test', text: 'withheld' }] : undefined,
+        },
+        isVideo: !!o.video,
+    }
+}
+type Msg = ReturnType<typeof msg>
+
+const me = peer(1, 'Dana Test', 'user', { isSelf: true })
+const clips = peer(-1001, 'Test Clips', 'chat', { chatType: 'channel', username: 'testclips', about: 'Short clips for trying the player: every container and codec the web player knows.', members: 12400 })
+const shows = peer(-1002, 'Test Shows', 'chat')
+const locked = peer(-1003, 'Locked Room', 'chat', { chatType: 'channel', raw: { noforwards: true } })
+const quiet = peer(-1004, 'Quiet Room', 'chat')
+const copies = peer(-1005, 'Test Copies', 'chat', { chatType: 'channel' })
+
+const messages = new Map<number, Msg[]>([
+    [
+        clips.id,
+        [
+            msg(clips, 'Native Clip.mp4', { file: 'h264-aac.mp4', video: true }),
+            msg(clips, 'Tail Index.mp4', { file: 'tail-index.mp4' }),
+            msg(clips, 'Matroska Clip.mkv', { file: 'h264-aac.mkv' }),
+            msg(clips, 'Transport Clip.ts', { file: 'h264-aac.ts' }),
+            msg(clips, 'Surround Clip.mkv', { file: 'h264-ac3.mkv' }),
+            msg(clips, 'Webm Clip.webm', { file: 'vp9-opus.webm' }),
+            msg(clips, 'Old Clip.avi', { file: 'mpeg4.avi' }),
+            msg(clips, 'Xvid Clip.avi', { file: 'xvid-mp3.avi' }),
+            msg(clips, 'Divx Clip.avi', { file: 'divx3.avi' }),
+            msg(clips, 'Avc Avi Clip.avi', { file: 'h264-mp3.avi' }),
+            msg(clips, 'Windows Clip.wmv', { file: 'wmv2.wmv' }),
+            msg(clips, 'Broken Clip.avi', { file: 'broken.avi' }),
+            msg(clips, 'Odd Picture Clip.avi', { file: 'msvideo1.avi' }),
+            msg(clips, 'Odd Sound Clip.avi', { file: 'mpeg4-g723.avi' }),
+            msg(clips, 'Cut Clip.avi', { file: 'cut.avi' }),
+            msg(clips, 'Burning Clip.mp4', { file: 'h264-aac.mp4', ttl: 30 }),
+            msg(clips, 'Withheld Clip.mp4', { file: 'h264-aac.mp4', withheld: true }),
+            msg(clips, 'Notes.pdf', { size: 20_000 }),
+        ],
+    ],
+    [shows.id, [1, 2, 3].map((e) => msg(shows, `Harbour.Notes.S01E0${e}.mkv`, { file: 'h264-aac.mkv' }))],
+    [locked.id, [msg(locked, 'Locked Clip.mp4', { file: 'h264-aac.mp4' })]],
+    [quiet.id, [msg(quiet, 'readme.pdf', { size: 2000 })]],
+    [me.id, [msg(me, 'Saved Clip.mp4', { file: 'h264-aac.mp4' })]],
+    // One film posted three times, as copies of it: the page lists them for choosing.
+    [copies.id, ['2160p.HDR.HEVC', '1080p.BluRay.x264', '720p.WEB-DL.x264'].map((q) => msg(copies, `Big.Buck.Bunny.2008.${q}.mkv`, { file: 'h264-aac.mkv' }))],
+])
+
+// `manyrecent`: four hundred more videos in Test Clips, for Recently added's See all to page through.
+if (flags.has('manyrecent')) {
+    const letters = (n: number) => [0, 1, 2].map((k) => String.fromCharCode(97 + (Math.floor(n / 26 ** k) % 26))).join('')
+    for (let i = 0; i < 400; i++) messages.get(clips.id)!.push(msg(clips, `Reel ${letters(i)}.mp4`, { file: 'h264-aac.mp4' }))
+}
+
+// A chat of its own at the very end (opened by its address, /chat/-1006), made last so no other id moves: 20 s,
+// chaptered, two episodes of one show, for the chapter, skip and autoplay tests.
+const lighthouse = peer(-1006, 'Lighthouse Show', 'chat')
+messages.set(
+    lighthouse.id,
+    ['Lighthouse.S01E01.mkv', 'Lighthouse.S01E02.mkv'].map((name) => msg(lighthouse, name, { file: 'chapters.mkv', video: true, duration: 20 })),
+)
+
+// `zipped`: a chat of its own (/chat/-1007, in no list, and in no search unless asked for) of videos in pieces: a stored
+// ZIP cut into four, a deflated one, a ZIP with a piece missing, a video cut into three raw pieces, and a phone backup.
+const zipped = peer(-1007, 'Zipped Room', 'chat')
+if (flags.has('zipped')) {
+    const zip = 'application/zip'
+    messages.set(zipped.id, [
+        ...[1, 2, 3, 4].map((i) => msg(zipped, `Zipped.Clip.2026.1080p.WEB-DL.zip.00${i}`, { file: `zipped.zip.00${i}`, mime: zip })),
+        msg(zipped, 'Deflated.Clip.2026.1080p.WEB-DL.zip.001', { file: 'deflated.zip.001', mime: zip }),
+        // Pieces 1, 2 and 4 of a ZIP: the directory is in the last, and the third is not in the chat.
+        ...[1, 2, 4].map((i) => msg(zipped, `Gap.Clip.2026.1080p.WEB-DL.zip.00${i}`, { file: `zipped.zip.00${i}`, mime: zip })),
+        ...[1, 2, 3].map((i) => msg(zipped, `Raw.Clip.2026.1080p.mkv.00${i}`, { file: `raw.mkv.00${i}`, mime: 'application/octet-stream' })),
+        msg(zipped, 'IvyWalletBackup_20260930-1830.zip', { size: 165_710, mime: zip }),
+    ])
+}
+
+// `oldformats`: a chat of its own (/chat/-1008, in no list) of the formats libav.js plays beyond AVI (player/libav.ts).
+const oldFormats = peer(-1008, 'Old Formats', 'chat')
+if (flags.has('oldformats')) {
+    messages.set(oldFormats.id, [
+        msg(oldFormats, 'Flash Clip.flv', { file: 'flv-mp3.flv' }),
+        msg(oldFormats, 'Real Clip.rm', { file: 'rv20-ac3.rm' }),
+        msg(oldFormats, 'Dvd Clip.vob', { file: 'mpeg2-mp2.vob' }),
+        msg(oldFormats, 'Broadcast Clip.ts', { file: 'mpeg2-mp2.ts' }),
+        msg(oldFormats, 'Part Two Clip.mkv', { file: 'mpeg4-aac.mkv' }),
+        msg(oldFormats, 'Lossless Sound Clip.mkv', { file: 'h264-truehd.mkv' }),
+        msg(oldFormats, 'Theora Clip.ogv', { file: 'theora-vorbis.ogv' }),
+    ])
+}
+
+const dialogs: Peer[] = [me, clips, shows, locked, quiet, copies]
+for (let i = 0; i < 1500; i++) dialogs.push(peer(-5000 - i, `Group ${i}`, 'chat'))
+dialogs.push(lighthouse)
+// Telegram's archive: two chats of its own, listed only when the archive is asked for.
+const archive: Peer[] = [peer(-7001, 'Archived Reels', 'chat', { chatType: 'channel' }), peer(-7002, 'Old Group', 'chat')]
+
+let globalFailsLeft = 2
+
+/** The raw calls made, readable in the worker as `fakeCalls`. */
+const calls: string[] = []
+
+export class TelegramClient {
+    storage = { self: { fetch: async () => (flags.has('signedout') ? null : { userId: 1 }) } }
+    constructor(_: unknown) {}
+    async prepare() {}
+    async getMe() {
+        if (flags.has('revoked')) throw rpcError('AUTH_KEY_UNREGISTERED', 401)
+        return new User({})
+    }
+    async getPasswordHint() {
+        return flags.has('password') ? 'harbour' : null
+    }
+    /** The QR sign in: a code that never gets scanned, or with `password`, one scanned at once that asks the password. */
+    async signInQr(p: { abortSignal?: AbortSignal; onUrlUpdated: (url: string, expires: Date) => void; password: () => Promise<string> }) {
+        p.onUrlUpdated('tg://login?token=e2e', new Date(Date.now() + 30_000))
+        if (flags.has('password')) {
+            await delay(50)
+            await p.password()
+            return new User({})
+        }
+        return new Promise<never>((_, reject) => p.abortSignal?.addEventListener('abort', () => reject(new Error('aborted'))))
+    }
+    async logOut() {}
+    async resolvePeer(id: number) {
+        return { _: 'inputPeerChannel', channelId: id, accessHash: 0 }
+    }
+    async getFullChat(id: number) {
+        const p = peers.get(id)
+        if (!p) throw rpcError('PEER_ID_INVALID')
+        if (flags.has('infofail')) throw rpcError('CHANNEL_PRIVATE')
+        return { bio: p.about ?? '', membersCount: p.members ?? 0 }
+    }
+    async getFullUser(id: number) {
+        if (!peers.has(id)) throw rpcError('PEER_ID_INVALID')
+        return { bio: '' }
+    }
+    async getPeer(id: number) {
+        const p = peers.get(id)
+        if (!p) throw rpcError('PEER_ID_INVALID')
+        return p
+    }
+    async call(q: { _: string; location?: { file: string | null }; offset?: number; limit?: number; option?: Uint8Array }) {
+        calls.push(q._)
+        if (q._ === 'upload.getFile') {
+            const file = q.location?.file
+            if (!file) throw rpcError('FILE_REFERENCE_INVALID')
+            const end = Math.min(q.offset! + q.limit!, sizes[file]) - 1
+            const res = await fetch(`/__e2e/media/${file}`, { headers: { Range: `bytes=${q.offset}-${end}` } })
+            return { _: 'upload.file', bytes: new Uint8Array(await res.arrayBuffer()) }
+        }
+        if (q._ === 'help.getNearestDc') return { country: 'GB' }
+        if (q._ === 'help.getCountriesList') return { _: 'help.countriesList', countries: [] }
+        if (q._ === 'messages.getSponsoredMessages')
+            return {
+                _: 'messages.sponsoredMessages',
+                postsBetween: 3,
+                messages: [{ _: 'sponsoredMessage', randomId: new Uint8Array([1, 2, 3]), url: 'https://example.org/', title: 'Lantern Maps', message: 'Hand drawn maps.', buttonText: 'Open', canReport: false }],
+            }
+        if (q._ === 'messages.viewSponsoredMessage' || q._ === 'messages.clickSponsoredMessage') return true
+        throw rpcError('METHOD_NOT_FAKED')
+    }
+    async searchMessages(p: { chatId: number | 'self'; query?: string; filter?: { _: string }; offset?: number; limit: number }) {
+        await delay(flags.has('slow') ? 3000 : 50)
+        // Saved Messages: the sync file, found by its caption.
+        if (p.chatId === 'self') return (await cloud.all(me)).filter((m) => m.text.includes(p.query ?? '')).slice(0, p.limit)
+        if (!p.filter) throw rpcError('FILTER_MISSING')
+        if (!peers.has(p.chatId)) throw rpcError('PEER_ID_INVALID')
+        const wantVideo = p.filter._ === 'inputMessagesFilterVideo'
+        const all = (messages.get(p.chatId) ?? []).filter((m) => m.isVideo === wantVideo).sort((a, b) => b.id - a.id)
+        const from = p.offset ?? 0
+        const page = Object.assign(all.slice(from, from + p.limit), { total: all.length, next: from + p.limit < all.length ? from + p.limit : undefined })
+        return page
+    }
+    /** Newest first, in pages: `offset.rate` is where the next page starts (Telegram's is its own cursor). */
+    async searchGlobal(p: { filter: { _: string }; query?: string; limit: number; offset?: { rate: number } }) {
+        await delay(flags.has('slow') ? 3000 : 50)
+        calls.push(`searchGlobal ${p.filter._} ${p.offset?.rate ?? 0}`)
+        // `recentfails`: the first ask across chats (both its feeds) fails, the next ones answer.
+        if (flags.has('recentfails') && globalFailsLeft-- > 0) throw rpcError('INTERNAL_SERVER_ERROR', 500)
+        const wantVideo = p.filter._ === 'inputMessagesFilterVideo'
+        const q = p.query?.toLowerCase() ?? ''
+        const all = [...messages.values()]
+            .flat()
+            .filter((m) => m.isVideo === wantVideo && m.media.fileName.toLowerCase().includes(q))
+            .sort((a, b) => b.date.getTime() - a.date.getTime())
+        const from = p.offset?.rate ?? 0
+        const next = from + p.limit < all.length ? { rate: from + p.limit, id: from + p.limit, peer: { _: 'inputPeerEmpty' } } : undefined
+        return Object.assign(all.slice(from, from + p.limit), { next })
+    }
+    async getHistory(_: 'self', p?: { limit?: number }) {
+        return (await cloud.all(me)).slice(0, p?.limit ?? 100)
+    }
+    async editMessage(p: { chatId: 'self'; message: number; text?: string; media: { file: Uint8Array; fileName: string } }) {
+        calls.push(`editMessage ${p.message}`)
+        return cloud.edit(me, p.message, { file: p.media.file, fileName: p.media.fileName, caption: p.text ?? '' })
+    }
+    async sendMedia(_: 'self', media: { file: Uint8Array; fileName: string; caption?: string }) {
+        calls.push('sendMedia')
+        return cloud.put(me, { file: media.file, fileName: media.fileName, caption: media.caption ?? '' })
+    }
+    async pinMessage(_: { chatId: 'self'; message: number }) {
+        calls.push('pinMessage')
+        return null
+    }
+    async deleteMessagesById(_: 'self', ids: number[]) {
+        calls.push(`deleteMessages ${ids.join(',')}`)
+        await cloud.remove(ids)
+    }
+    async getMessages(chatId: number | 'self', ids: number | number[]) {
+        if (chatId === 'self') {
+            const all = await cloud.all(me)
+            return [ids].flat().map((id) => all.find((m) => m.id === id) ?? null)
+        }
+        if (!peers.has(chatId)) throw rpcError('PEER_ID_INVALID')
+        return [ids].flat().map((id) => (messages.get(chatId) ?? []).find((m) => m.id === id) ?? null)
+    }
+    async *iterDialogs(p?: { archived?: string; limit?: number }) {
+        const list = p?.archived === 'only' ? archive : dialogs
+        const limit = Math.min(list.length, p?.limit ?? Infinity)
+        for (let i = 0; i < limit; i++) {
+            if (i % 100 === 0) await delay(20)
+            yield { peer: list[i], isPinned: p?.archived !== 'only' && i < 2 }
+        }
+    }
+    async downloadAsBuffer(t: { url: string; bytes?: Uint8Array }) {
+        if (t.bytes) return t.bytes
+        return new Uint8Array(await (await fetch(t.url)).arrayBuffer())
+    }
+}
+;(globalThis as { fakeCalls?: string[] }).fakeCalls = calls
