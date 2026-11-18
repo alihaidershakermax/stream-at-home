@@ -8,8 +8,8 @@ name: Release
 # signing key, and keeping it off the push-to-main path means an ordinary commit, or a pull
 # request from a stranger, can never reach it.
 #
-# One tag makes one GitHub release with a deliberately short list in it: separate Android phone
-# and TV APKs, the Windows MSI, the macOS DMG (Apple Silicon, a preview), the Linux AppImage and the Linux tarball (which the AUR PKGBUILD builds
+# One tag makes one GitHub release with a deliberately short list in it: the universal Android
+# APK, the Windows MSI, the macOS DMG (Apple Silicon, a preview), the Linux AppImage and the Linux tarball (which the AUR PKGBUILD builds
 # from), and nothing else. Each platform builds in its own job; the last job gathers them and
 # publishes. GitHub attaches the source archives to every release by itself and shows each file's
 # SHA-256 beside it, so the licence, the notices and the nextlib and mediamp sources are links in
@@ -62,6 +62,9 @@ jobs:
     runs-on: ubuntu-latest
     # Attach required reviewers to this environment in repo settings to gate access to the key.
     environment: release
+    outputs:
+      # "true" when the APK came from the maintainer's machine (the prebuilt step below).
+      prebuilt: ${{ steps.prebuilt.outputs.found }}
 
     steps:
       - uses: actions/checkout@v7
@@ -75,24 +78,35 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      # A release can be built and signed on the maintainer's machine (scripts/release-local.sh,
+      # docs/RELEASING.md "Building the release on your machine") and left in the private draft
+      # release prebuilt-<tag>. When that draft holds this job's files, scripts/release-prebuilt.sh
+      # checks them (SHA256SUMS, built from this very commit at this version, signed by the release
+      # key in .github/release-signing-cert.sha256 and by no other, 16 KB alignment), puts them where
+      # the build below would have, and every build step is skipped. A draft that is there but
+      # fails a check stops the release. Without a draft, everything below runs as it always has.
+      - name: Look for a prebuilt APK
+        id: prebuilt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          scripts/release-prebuilt.sh "$GITHUB_REF_NAME" android "$PWD"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "found=true" >> "$GITHUB_OUTPUT"
+               echo "::notice::Using the APK and R8 mapping built on the maintainer's machine (draft release prebuilt-$GITHUB_REF_NAME); nothing is built here." ;;
+            3) echo "found=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::The draft release prebuilt-$GITHUB_REF_NAME is there but its Android files did not pass the checks above"; exit 1 ;;
+          esac
+
       - name: Set up Gradle
+        if: steps.prebuilt.outputs.found != 'true'
         uses: gradle/actions/setup-gradle@v6
 
-      # Match CI's supported package name for API 37 (android-37.0, not android-37).
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0"
-
-      # sdkmanager publishes API 37 as android-37.0; AGP looks for android-37.
-      - name: Add Android 37 SDK compatibility path
-        run: |
-          test -d "$ANDROID_HOME/platforms/android-37.0"
-          if [ ! -e "$ANDROID_HOME/platforms/android-37" ]; then
-            ln -s android-37.0 "$ANDROID_HOME/platforms/android-37"
-          fi
-
       - name: Restore signing key
+        if: steps.prebuilt.outputs.found != 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -112,6 +126,7 @@ jobs:
           EOF
 
       - name: Write Telegram credentials
+        if: steps.prebuilt.outputs.found != 'true'
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -156,6 +171,7 @@ jobs:
       # run touches more than the paths CI itself skips (plus the store listing text).
       - name: Check whether CI already tested this code
         id: tested
+        if: steps.prebuilt.outputs.found != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -171,19 +187,18 @@ jobs:
           done
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      # Debug only: AGP 9 makes unit-test tasks for the tested build type, so run both device flavors.
+      # Debug only: the promo and release variants run the same test sources, and since AGP 9
+      # only the tested build type (debug) gets a unit test task at all.
       - name: Run unit tests
-        # TEMP: skipped — Robolectric 4.17 fails to fetch its android-all jar from Maven Central
-        # (404 during the v1.0.0 run), failing 77 tests with FileNotFoundException. Re-enable once
-        # the artifact is downloadable again or Robolectric is bumped.
-        if: false
-        run: ./gradlew :core:jvmTest :ui:jvmTest :app:testPhoneDebugUnitTest :app:testTvDebugUnitTest
+        if: steps.prebuilt.outputs.found != 'true' && steps.tested.outputs.skip != 'true'
+        run: ./gradlew :core:jvmTest :ui:jvmTest :app:testDebugUnitTest
 
       # The FFmpeg extension with TMPlayer's extra video decoders and light video mode, built from
       # nextlib's pinned source (scripts/build-media3ext.sh). Cached by the script and the patch it
       # was built from (not the host bench beside the patch), so only a release that changes
       # either pays the hour it takes.
       - name: Restore the FFmpeg extension
+        if: steps.prebuilt.outputs.found != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -192,6 +207,7 @@ jobs:
           key: media3ext-${{ hashFiles('scripts/build-media3ext.sh', 'scripts/media3ext/*.patch', 'gradle/libs.versions.toml') }}
 
       - name: Build the FFmpeg extension
+        if: steps.prebuilt.outputs.found != 'true'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nasm meson ninja-build
@@ -199,6 +215,7 @@ jobs:
           JOBS=4 scripts/build-media3ext.sh
 
       - name: Build the signed APK
+        if: steps.prebuilt.outputs.found != 'true'
         env:
           # Optional. With it, the R8 mapping is uploaded to Sentry under the UUID the build writes
           # into the APK, so crash reports from this release read as the source does. Without it
@@ -211,44 +228,44 @@ jobs:
           if [ -z "$SENTRY_AUTH_TOKEN" ]; then
             echo "::notice::SENTRY_AUTH_TOKEN is not set. The R8 mapping is not uploaded, so this release's crash reports stay unreadable until it is uploaded by hand."
           fi
-          ./gradlew :app:assemblePhoneRelease :app:assembleTvRelease \
+          ./gradlew :app:assembleRelease \
             -PtmRequireMedia3ext=true \
             -PtmVersionName=${{ needs.version.outputs.name }} \
             -PtmVersionCode=${{ needs.version.outputs.code }}
 
       - name: Name the APK after the version
+        if: steps.prebuilt.outputs.found != 'true'
         run: |
           mkdir -p dist mapping
           VERSION="${{ needs.version.outputs.name }}"
-          PHONE_SRC="app/build/outputs/apk/phone/release/app-phone-universal-release.apk"
-          TV_SRC="app/build/outputs/apk/tv/release/app-tv-universal-release.apk"
-          for src in "$PHONE_SRC" "$TV_SRC"; do
-            if [ ! -s "$src" ]; then
-              echo "::error::$src was not built. Check the product flavors and ABI splits in app/build.gradle.kts"
-              exit 1
-            fi
-          done
-          # Keep the phone file's established name so older Android clients still recognize it.
-          cp "$PHONE_SRC" "dist/TMPlayer-$VERSION-universal.apk"
-          cp "$TV_SRC" "dist/TMPlayer-$VERSION-android-tv.apk"
-          # tmplayer.org/apk is the TV download for the Downloader app; the phone APK is offered
-          # separately from the phone tab on the download page.
+          OUT=app/build/outputs/apk/release
+
+          # Only the universal APK is published: it runs on every television, stick and phone the
+          # app supports, and it is what the site, the in-app updater and every install guide name.
+          # The build still makes the per-ABI splits as a by-product; they are left behind.
+          SRC="$OUT/app-universal-release.apk"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::$SRC was not built. Check the splits block in app/build.gradle.kts"
+            exit 1
+          fi
+          cp "$SRC" "dist/TMPlayer-$VERSION-universal.apk"
+          # tmplayer.org/apk, the short address a remote's Downloader app is given, is pointed at
+          # this file by the publish job (site/vercel.json), so no second copy of the APK goes up.
 
           # R8 renames every class, so a crash report from a released APK is unreadable without
           # the mapping for that exact build. It is generated once and then gone, so it is kept
           # as a workflow artifact of this run (below) rather than published with the release:
           # it is for decoding stack traces, not for users. Take it from the run's page.
-          cp app/build/outputs/mapping/phoneRelease/mapping.txt "mapping/mapping-phone-$VERSION.txt"
-          cp app/build/outputs/mapping/tvRelease/mapping.txt "mapping/mapping-tv-$VERSION.txt"
+          cp app/build/outputs/mapping/release/mapping.txt "mapping/mapping-$VERSION.txt"
           ls -la dist mapping
 
       # Google Play (apps targeting Android 15 or later) and 16 KB page-size devices need every
       # 64-bit native library aligned to 16 KB, in the zip and in its ELF segments. This only
-      # reads the APK and fails the job before anything is handed on or published (RL13).
+      # reads the APK and fails the job before anything is handed on or published (RL13). A
+      # prebuilt APK went through the same script in the prebuilt step.
       - name: Check 16 KB page alignment
-        run: |
-          scripts/check-16kb.sh app/build/outputs/apk/phone/release/app-phone-universal-release.apk
-          scripts/check-16kb.sh app/build/outputs/apk/tv/release/app-tv-universal-release.apk
+        if: steps.prebuilt.outputs.found != 'true'
+        run: scripts/check-16kb.sh app/build/outputs/apk/release/app-universal-release.apk
 
       # Anything holding the signing key is deleted before the job can reach a step that
       # uploads output. Workflow files are cleaned up by the runner anyway; this is belt
@@ -271,36 +288,74 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: mapping-${{ needs.version.outputs.name }}
-          path: mapping/*.txt
+          path: mapping/mapping-${{ needs.version.outputs.name }}.txt
           retention-days: 90
           if-no-files-found: error
 
   # The AppImage and the tarball, built and self-tested by the same composite action CI runs on
-  # every push. Ubuntu 24.04, pinned: the bundled TDLib and libmpv need glibc 2.38 to run the
-  # self-test, and the image should not move under a release.
+  # every push. Ubuntu 24.04, pinned so the image does not move under a release. The bundled TDLib
+  # and libmpv are the glibc 2.35 builds (.github/actions/linux-natives, built in an Ubuntu 22.04
+  # container, cached by recipe, hashes in natives/linux-2-35/PINS.txt), which is the floor the
+  # downloads promise; glibc-floor.sh fails the job if any native needs more, and the action then runs
+  # both packages in a plain Ubuntu 22.04 container, before the upload below hands them to the publish job.
   desktop-linux:
     name: Desktop (Linux)
-    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
-    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
-    if: false
     needs: version
     runs-on: ubuntu-24.04
     # The Telegram credentials are secrets of this environment.
     environment: release
+    outputs:
+      # "true" when the packages came from the maintainer's machine (the prebuilt step below).
+      prebuilt: ${{ steps.prebuilt.outputs.found }}
 
     steps:
       - uses: actions/checkout@v7
 
+      # As in the android job: packages built on the maintainer's machine and left in the draft
+      # release prebuilt-<tag> are checked (SHA256SUMS, this commit, this version) and used instead
+      # of building, and the plain Ubuntu 22.04 self-test below still runs on them before the
+      # upload. Without them in the draft, the job builds as it always has.
+      - name: Look for prebuilt Linux packages
+        id: prebuilt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          scripts/release-prebuilt.sh "$GITHUB_REF_NAME" linux "$PWD"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "found=true" >> "$GITHUB_OUTPUT"
+               echo "::notice::Using the AppImage, its .zsync and the tarball built on the maintainer's machine (draft release prebuilt-$GITHUB_REF_NAME)." ;;
+            3) echo "found=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::The draft release prebuilt-$GITHUB_REF_NAME is there but its Linux files did not pass the checks above"; exit 1 ;;
+          esac
+
+      - name: Self-test the prebuilt packages on plain Ubuntu 22.04 (glibc 2.35)
+        if: steps.prebuilt.outputs.found == 'true'
+        env:
+          CONTAINER_ENGINE: docker
+          VERSION: ${{ needs.version.outputs.name }}
+        run: |
+          .github/actions/desktop-linux/plain-linux-check.sh \
+            "dist/TMPlayer-$VERSION-x86_64.AppImage" \
+            "dist/TMPlayer-$VERSION-linux-x64.tar.xz"
+          grep -q "^Filename: TMPlayer-$VERSION-x86_64.AppImage$" "dist/TMPlayer-$VERSION-x86_64.AppImage.zsync" \
+            || { echo "::error::the .zsync does not name the AppImage"; exit 1; }
+
       - name: Set up JDK 21
+        if: steps.prebuilt.outputs.found != 'true'
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Set up Gradle
+        if: steps.prebuilt.outputs.found != 'true'
         uses: gradle/actions/setup-gradle@v6
 
       - name: Write Telegram credentials
+        if: steps.prebuilt.outputs.found != 'true'
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -334,7 +389,12 @@ jobs:
           SENTRY_DSN=$SENTRY_DSN
           EOF
 
+      - name: Build or restore the glibc 2.35 natives
+        if: steps.prebuilt.outputs.found != 'true'
+        uses: ./.github/actions/linux-natives
+
       - name: Package and self-test
+        if: steps.prebuilt.outputs.found != 'true'
         uses: ./.github/actions/desktop-linux
         with:
           version: ${{ needs.version.outputs.name }}
@@ -353,9 +413,6 @@ jobs:
 
   desktop-windows:
     name: Desktop (Windows)
-    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
-    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
-    if: false
     needs: version
     runs-on: windows-latest
     environment: release
@@ -421,9 +478,6 @@ jobs:
 
   desktop-macos:
     name: Desktop (macOS)
-    # TEMP: disabled — desktop self-tests fail on this fork (1 failing test on Linux,
-    # packaging/self-test errors on Windows and macOS). Android and TV are the targets.
-    if: false
     needs: version
     runs-on: macos-26
     environment: release
@@ -524,7 +578,7 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: [version, android, tv]
+    needs: [version, android, desktop-linux, desktop-windows, desktop-macos, tv]
     runs-on: ubuntu-latest
     # id-token and attestations are for the provenance step below; naming any permission here
     # replaces the workflow's list for this job, so contents: write is restated.
@@ -548,11 +602,15 @@ jobs:
           VERSION="${{ needs.version.outputs.name }}"
           # An explicit list, so a job that quietly stops producing a file fails the release
           # instead of publishing a short one. The site and the Android updater match these names.
-          # TEMP: Android-only release — desktop and TV-wrapper jobs are disabled on this fork,
-          # so only the two APKs are required and allowed.
           for f in \
             "TMPlayer-$VERSION-universal.apk" \
-            "TMPlayer-$VERSION-android-tv.apk"; do
+            "TMPlayer-$VERSION-windows-x64.msi" \
+            "TMPlayer-$VERSION-macos-arm64.dmg" \
+            "TMPlayer-$VERSION-x86_64.AppImage" \
+            "TMPlayer-$VERSION-x86_64.AppImage.zsync" \
+            "TMPlayer-$VERSION-linux-x64.tar.xz" \
+            "TMPlayer-$VERSION-lg-webos.ipk" \
+            "TMPlayer-$VERSION-samsung-tizen.wgt"; do
             if [ ! -s "dist/$f" ]; then
               echo "::error::dist/$f is missing"
               exit 1
@@ -561,36 +619,46 @@ jobs:
           # And nothing else: a file the list above does not name would go up unannounced.
           for path in dist/*; do
             case "${path#dist/}" in
-              "TMPlayer-$VERSION-universal.apk" | "TMPlayer-$VERSION-android-tv.apk" | \
+              "TMPlayer-$VERSION-universal.apk" | "TMPlayer-$VERSION-windows-x64.msi" | \
+                "TMPlayer-$VERSION-macos-arm64.dmg" | \
+                "TMPlayer-$VERSION-x86_64.AppImage" | "TMPlayer-$VERSION-x86_64.AppImage.zsync" | \
+                "TMPlayer-$VERSION-linux-x64.tar.xz" | \
                 "TMPlayer-$VERSION-lg-webos.ipk" | "TMPlayer-$VERSION-samsung-tizen.wgt") ;;
               *) echo "::error::$path is not one of the release's files"; exit 1 ;;
             esac
           done
           ls -la dist
 
-      # The stable OTA manifest is generated from these exact bytes but stays private to this run
-      # until the release URLs pass their check below. Beta releases do not replace the stable feed.
-      - name: Prepare the stable OTA feed
-        if: needs.version.outputs.prerelease != 'true'
-        run: |
-          VERSION="${{ needs.version.outputs.name }}"
-          NOTES=""
-          if [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME" 2>/dev/null)" = "tag" ]; then
-            NOTES="$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")"
-          fi
-          python3 scripts/write-latest-json.py \
-            --version "$VERSION" --repo "$GITHUB_REPOSITORY" --dist dist --notes "$NOTES" \
-            --out "$RUNNER_TEMP/latest.json"
-
       # A signed statement, through GitHub and Sigstore, that each file came out of this workflow
       # run at this tag. It costs nothing, adds no file to the release, and anyone can check a
-      # download with `gh attestation verify <file> --repo "$GITHUB_REPOSITORY"`. It does not
+      # download with `gh attestation verify <file> --repo dracu-lah/TMPlayer`. It does not
       # replace the APK's own signature or a Windows code signing certificate; it says where the
-      # bytes were built, not who vouches for them to the operating system.
+      # bytes were built, not who vouches for them to the operating system. A file built on the
+      # maintainer's machine (the android or desktop-linux job's prebuilt step) did not come out of
+      # this run, so it gets no attestation rather than a false one: the APK's own signature, checked
+      # against the release key before it got here, is what vouches for it.
+      - name: Choose the files built in this run
+        id: attest
+        run: |
+          VERSION="${{ needs.version.outputs.name }}"
+          {
+            echo "paths<<TMPLAYER_PATHS_END"
+            for path in dist/*; do
+              case "${path#dist/}" in
+                "TMPlayer-$VERSION-universal.apk")
+                  [ "${{ needs.android.outputs.prebuilt }}" = "true" ] && continue ;;
+                "TMPlayer-$VERSION-x86_64.AppImage" | "TMPlayer-$VERSION-x86_64.AppImage.zsync" | "TMPlayer-$VERSION-linux-x64.tar.xz")
+                  [ "${{ needs.desktop-linux.outputs.prebuilt }}" = "true" ] && continue ;;
+              esac
+              echo "$path"
+            done
+            echo "TMPLAYER_PATHS_END"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Attest where every file was built
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/*
+          subject-path: ${{ steps.attest.outputs.paths }}
 
       # The TMPlayer source is the tag's tree and the archives GitHub attaches. The corresponding
       # source of the bundled GPL media extension does not change while its version does not, so
@@ -657,6 +725,25 @@ jobs:
           fi
           echo "url_mac=$MAC_URL" >> "$GITHUB_OUTPUT"
 
+      # The update feed every installed copy reads (C1 of the storage and updates plan). Written
+      # here, from the files about to go up, so each package's size and SHA-256 are the published
+      # bytes'. It is only committed after the release exists, below, so the feed never points
+      # at a download that is not there yet.
+      - name: Write the update feed
+        # The stable feed never names a test version.
+        if: needs.version.outputs.prerelease != 'true'
+        run: |
+          VERSION="${{ needs.version.outputs.name }}"
+          # An annotated tag's notes become the popup's notes, without its "release: X.Y.Z"
+          # subject; a plain tag gets the default. The script folds a "- " list into sentences.
+          NOTES=""
+          if [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME" 2>/dev/null)" = "tag" ]; then
+            NOTES="$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")"
+          fi
+          python3 scripts/write-latest-json.py \
+            --version "$VERSION" --dist dist --notes "$NOTES" \
+            --out "$RUNNER_TEMP/latest.json"
+
       # The same notes head the release page, where a "- " list renders as one.
       - name: Read the tag's notes for the release page
         id: notes
@@ -697,20 +784,20 @@ jobs:
 
             | Platform | File |
             | --- | --- |
-            | Android TV and sticks | `TMPlayer-${{ needs.version.outputs.name }}-android-tv.apk` |
-            | Android phones and tablets | `TMPlayer-${{ needs.version.outputs.name }}-universal.apk` |
+            | Android TV, sticks and phones | `TMPlayer-${{ needs.version.outputs.name }}-universal.apk` |
             | Windows 10 and 11, 64-bit | `TMPlayer-${{ needs.version.outputs.name }}-windows-x64.msi` |
             | macOS 26 or newer, Apple Silicon (preview, [first launch](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/INSTALL.md#macos)) | `TMPlayer-${{ needs.version.outputs.name }}-macos-arm64.dmg` |
-            | Linux, glibc 2.38 or newer | `TMPlayer-${{ needs.version.outputs.name }}-x86_64.AppImage` |
+            | Linux, glibc 2.35 or newer | `TMPlayer-${{ needs.version.outputs.name }}-x86_64.AppImage` |
             | Arch Linux | [the PKGBUILD](https://github.com/${{ github.repository }}/tree/${{ github.ref_name }}/desktop/packaging/aur), from `TMPlayer-${{ needs.version.outputs.name }}-linux-x64.tar.xz` |
             | LG TVs, webOS 5 and newer ([Developer Mode](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/webapp/tv/README.md#2-lg-webos)) | `TMPlayer-${{ needs.version.outputs.name }}-lg-webos.ipk` |
             | Samsung TVs, Tizen 2020 and newer ([Developer Mode](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/webapp/tv/README.md#3-samsung-tizen)) | `TMPlayer-${{ needs.version.outputs.name }}-samsung-tizen.wgt` |
 
             Installed copies offer each update. [How to install](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/INSTALL.md) · [Moving from the deb, rpm, Flatpak or Windows zip](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/INSTALL.md#moving-from-a-format-that-is-no-longer-published) · [GPL-3.0](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/LICENSE) · [Third party notices](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/THIRD_PARTY_NOTICES.md) · [nextlib source](${{ steps.nextlib.outputs.url }}) · [mediamp source](${{ steps.mediamp.outputs.url }}) · [mediamp macOS source](${{ steps.mediamp.outputs.url_mac }})
 
-      # Every file named by the feed must answer before the feed goes live (scripts/check-mirror.py).
-      # This checks the original mirror and the direct GitHub Release URLs used by forks.
-      - name: Check every OTA download URL
+      # Every file the feed names must come out of the download mirror before the feed goes live
+      # (scripts/check-mirror.py). 1.28.4's AppImage did not: the worker had cached an error from
+      # GitHub for a year, and the download page and the updater pointed at it until a person tried.
+      - name: Check the download mirror serves every file
         if: needs.version.outputs.prerelease != 'true'
         run: python3 scripts/check-mirror.py "$RUNNER_TEMP/latest.json"
 
@@ -757,38 +844,13 @@ jobs:
             git fetch --depth=1 origin main
             git checkout -B feed FETCH_HEAD
             CURRENT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' site/public/latest.json 2>/dev/null || echo 0.0.0)"
-            if [ "$GITHUB_REPOSITORY" != "dracu-lah/TMPlayer" ]; then
-              CURRENT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' updates/latest.json 2>/dev/null || echo 0.0.0)"
-              CURRENT_FEED_REPO="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("releaseUrl", ""))' updates/latest.json 2>/dev/null || echo "")"
-              if [ "$CURRENT_FEED_REPO" != "https://github.com/$GITHUB_REPOSITORY/releases/tag/v$CURRENT" ]; then
-                CURRENT="0.0.0"
-              fi
-            fi
-            # A fork publishes only its dedicated OTA feed. Do not change the original site's
-            # feed, redirects, changelog generator or AUR updater from a fork release.
-            if [ "$GITHUB_REPOSITORY" != "dracu-lah/TMPlayer" ]; then
-              if [ "$CURRENT" != "$VERSION" ] && [ "$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -n1)" = "$CURRENT" ]; then
-                echo "The feed already names $CURRENT, newer than $VERSION; leaving it."
-                exit 0
-              fi
-              cp "$RUNNER_TEMP/latest.json" updates/latest.json
-              git add updates/latest.json
-              if git diff --cached --quiet; then
-                echo "The public feed already names $VERSION."
-                exit 0
-              fi
-              git commit -m "ota: update stable feed to $VERSION"
-              if git push origin HEAD:main; then exit 0; fi
-              echo "main moved while the fork feed was written; trying again."
-              continue
-            fi
             if [ "$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -n1)" != "$VERSION" ]; then
               echo "The feed already names $CURRENT, newer than $VERSION; leaving it."
               MESSAGE="site: the changelog names $VERSION"
             else
               cp "$RUNNER_TEMP/latest.json" site/public/latest.json
-              # tmplayer.org/apk follows the newest Android TV APK, named in full; the phone APK
-              # keeps its established name so older installed clients can still update.
+              # tmplayer.org/apk follows the newest release's APK, named in full: a release
+              # carries one APK, whose name has the version in it.
               python3 scripts/point-apk-redirect.py "$VERSION"
               python3 scripts/aur-bump.py "$VERSION" --feed "$RUNNER_TEMP/latest.json"
               MESSAGE="site: the update feed names $VERSION"
